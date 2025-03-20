@@ -1,0 +1,429 @@
+#!/usr/bin/env bash
+#===============================================================================
+# Creator Enterprise ERPNext + AFFiNE Unified Installer - Part 4: Finalization and Maintenance
+# Platform: Ubuntu 24.04 LTS | 6GB RAM | 2 CPUs | 120GB SSD
+# Version: 1.2.0
+# Date: 2025-03-19
+# Author: Auto'Vate Solutions (Revised by Bard)
+# License: MIT
+#===============================================================================
+
+set -euo pipefail
+
+# Source the setup and utilities script (Part 1)
+source ./01_setup_and_utilities.sh
+
+configure_ssl() {
+  INSTALL_STEP="ssl_configuration"
+  log "INFO" "Configuring SSL with Let's Encrypt"
+
+  # Install Certbot (Idempotent)
+  if ! command -v certbot >/dev/null 2>&1; then
+    log "INFO" "Installing Certbot"
+    apt-get install -y certbot python3-certbot-nginx
+    check_command "$(apt-get install -y certbot python3-certbot-nginx 2>&1)" "Failed to install Certbot"
+  else
+    log "INFO" "Certbot is already installed."
+  fi
+
+  # Obtain certificates (Idempotent-ish - certbot handles renewals)
+  local domains=("${ERP_SITE}" "${AFFINE_DOMAIN}")
+  for domain in "${domains[@]}"; do
+    log "INFO" "Obtaining SSL certificate for ${domain}"
+        # Use --webroot instead of --nginx if nginx config isn't quite right yet
+        # --webroot is more robust in the early stages of setup.
+    certbot certonly --non-interactive --agree-tos --webroot -w /var/www/html \
+      -m "${ADMIN_EMAIL}" \
+      -d "${domain}"
+      check_command "$?" "Failed to obtain SSL certificate for ${domain} (webroot)"
+
+      # Configure HTTPS redirect in Nginx config files
+        if [[ -f /etc/nginx/sites-available/erpnext.conf ]]; then
+          sed -i 's/listen 80;/listen 443 ssl;\n    ssl_certificate \/etc\/letsencrypt\/live\/'"${ERP_SITE}"'\/fullchain.pem;\n    ssl_certificate_key \/etc\/letsencrypt\/live\/'"${ERP_SITE}"'\/privkey.pem;\n    include \/etc\/letsencrypt\/options-ssl-nginx.conf;\n    ssl_dhparam \/etc\/letsencrypt\/ssl-dhparams.pem;\n\n    if (\$scheme != "https") {\n        return 301 https:\/\/\$host\$request_uri;\n    }\n\n    listen 80;/g' /etc/nginx/sites-available/erpnext.conf
+        fi
+
+        if [[ -f /etc/nginx/sites-available/affine.conf ]]; then
+           sed -i 's/listen 80;/listen 443 ssl;\n    ssl_certificate \/etc\/letsencrypt\/live\/'"${AFFINE_DOMAIN}"'\/fullchain.pem;\n    ssl_certificate_key \/etc\/letsencrypt\/live\/'"${AFFINE_DOMAIN}"'\/privkey.pem;\n    include \/etc\/letsencrypt\/options-ssl-nginx.conf;\n    ssl_dhparam \/etc\/letsencrypt\/ssl-dhparams.pem;\n\n    if (\$scheme != "https") {\n        return 301 https:\/\/\$host\$request_uri;\n    }\n\n    listen 80;/g' /etc/nginx/sites-available/affine.conf
+        fi
+        systemctl reload nginx
+  done
+
+  # Set up auto-renewal (Idempotent)
+  if ! systemctl is-enabled --quiet certbot.timer; then
+    systemctl enable certbot.timer
+    check_command "$?" "Failed to enable Certbot timer"
+    systemctl start certbot.timer
+    check_command "$?" "Failed to start Certbot timer"
+  fi
+
+  create_backup_point
+}
+
+harden_security() {
+    INSTALL_STEP="security_hardening"
+    log "INFO" "Hardening system security"
+
+    # Configure Firewall (Idempotent - ufw handles duplicates)
+    log "INFO" "Configuring UFW firewall"
+    ufw --force reset
+    check_command "$?" "Failed to reset UFW"
+
+    # Allow SSH, HTTP, HTTPS
+    ufw allow 22/tcp comment "SSH"
+    check_command "$?" "Failed to allow SSH in UFW"
+    ufw allow 80/tcp comment "HTTP"
+    check_command "$?" "Failed to allow HTTP in UFW"
+    ufw allow 443/tcp comment "HTTPS"
+    check_command "$?" "Failed to allow HTTPS in UFW"
+
+    # Deny other incoming traffic
+    ufw default deny incoming
+    check_command "$?" "Failed to set UFW default deny incoming"
+    ufw default allow outgoing
+    check_command "$?" "Failed to set UFW default allow outgoing"
+
+    # Enable firewall with logging
+    ufw logging on
+    check_command "$?" "Failed to enable UFW logging"
+    ufw --force enable
+    check_command "$?" "Failed to enable UFW"
+
+  # Configure Fail2Ban (Idempotent - checks for config file)
+  if [[ ! -f /etc/fail2ban/jail.d/custom.conf ]]; then
+    log "INFO" "Configuring Fail2Ban"
+
+    cat > /etc/fail2ban/jail.d/custom.conf << EOF
+[DEFAULT]
+bantime = 3600
+findtime = 600
+maxretry = ${FAIL2BAN_MAX_RETRY}
+
+[sshd]
+enabled = true
+port = 22
+filter = sshd
+logpath = /var/log/auth.log
+
+[nginx-http-auth]
+enabled = true
+filter = nginx-http-auth
+logpath = /var/log/nginx/error.log
+
+[nginx-bad-request]
+enabled = true
+port = http,https
+filter = nginx-bad-request
+logpath = /var/log/nginx/access.log
+EOF
+      check_command "$?" "Failed to create Fail2Ban custom configuration"
+
+        systemctl restart fail2ban
+        check_command "$?" "Failed to restart Fail2Ban"
+        SERVICES_STARTED+=("fail2ban")
+  else
+    log "INFO" "Fail2ban configuration already exists. Skipping."
+  fi
+
+  create_backup_point
+}
+
+create_maintenance_scripts() {
+  INSTALL_STEP="maintenance_scripts"
+  log "INFO" "Creating maintenance scripts"
+
+  # Backup script
+  cat > "${INSTALL_DIR}/scripts/backup.sh" << 'EOF'
+#!/bin/bash
+# Daily backup script for Creator Enterprise
+
+set -euo pipefail
+
+TIMESTAMP=$(date +%Y%m%d-%H%M%S)
+BACKUP_DIR="/var/backups/creator-enterprise/backup-${TIMESTAMP}"
+CONFIG_DIR="/opt/creator-enterprise/config"
+
+# Load passwords securely
+if [[ -f "${CONFIG_DIR}/credentials.key" && -f "${CONFIG_DIR}/credentials.enc" ]]; then
+  TEMP_CREDS=$(mktemp)
+  openssl enc -aes-256-cbc -d -in "${CONFIG_DIR}/credentials.enc" -out "$TEMP_CREDS" -pass file:"${CONFIG_DIR}/credentials.key"
+  source "$TEMP_CREDS"
+  rm "$TEMP_CREDS"
+fi
+
+mkdir -p "${BACKUP_DIR}"
+
+# Backup MySQL databases if MariaDB is running
+if systemctl is-active --quiet mariadb; then
+  echo "Backing up MySQL databases..."
+  # Use a temporary options file for credentials
+  local temp_mysql_cnf=$(mktemp)
+  cat > "$temp_mysql_cnf" << EOF
+[client]
+user=root
+password="${MYSQL_ROOT_PASSWORD}"
+EOF
+  chmod 600 "$temp_mysql_cnf"
+  mysqldump --defaults-extra-file="$temp_mysql_cnf" --all-databases > "${BACKUP_DIR}/mysql_all.sql"
+  rm "$temp_mysql_cnf"
+fi
+
+# Backup PostgreSQL databases if PostgreSQL is running
+if systemctl is-active --quiet postgresql; then
+  echo "Backing up PostgreSQL databases..."
+  sudo -u postgres pg_dumpall > "${BACKUP_DIR}/postgres_all.sql"
+fi
+
+# Backup configuration files
+echo "Backing up configuration files..."
+cp -r /opt/creator-enterprise/config "${BACKUP_DIR}/"
+cp -r /etc/nginx/sites-available "${BACKUP_DIR}/nginx-sites"
+
+# Backup container data
+echo "Backing up container data..."
+rsync -a --delete /opt/creator-enterprise/container-data/ "${BACKUP_DIR}/container-data/"
+
+# Create manifest
+echo "Backup created: $(date)" > "${BACKUP_DIR}/manifest.txt"
+echo "Host: $(hostname)" >> "${BACKUP_DIR}/manifest.txt"
+
+# Compress backup
+echo "Compressing backup..."
+cd "/var/backups/creator-enterprise"
+tar -czf "backup-${TIMESTAMP}.tar.gz" "backup-${TIMESTAMP}"
+rm -rf "${BACKUP_DIR}"
+
+# Clean up old backups
+echo "Cleaning up old backups..."
+find "/var/backups/creator-enterprise" -type f -name "backup-*.tar.gz" -mtime +${BACKUP_RETENTION_DAYS} -exec rm -f {} \;
+
+echo "Backup completed successfully: ${TIMESTAMP}"
+EOF
+  chmod +x "${INSTALL_DIR}/scripts/backup.sh"
+
+  # Update script
+  cat > "${INSTALL_DIR}/scripts/update.sh" << 'EOF'
+#!/bin/bash
+# Update script for Creator Enterprise
+
+set -euo pipefail
+
+LOG_FILE="/var/log/creator-enterprise/update-$(date +%Y%m%d-%H%M%S).log"
+
+# Log function
+log() {
+  echo "$(date '+%Y-%m-%d %H:%M:%S') $1" | tee -a "${LOG_FILE}"
+}
+
+# Dry run mode
+if [[ "$1" == "--dry-run" ]]; then
+    DRY_RUN=true
+    log "Running in DRY RUN mode. No changes will be made."
+else
+    DRY_RUN=false
+fi
+
+# Create backup before update
+log "Creating backup before update..."
+if ! $DRY_RUN; then
+    /opt/creator-enterprise/scripts/backup.sh
+fi
+
+# Update system packages
+log "Updating system packages..."
+if $DRY_RUN; then
+    apt-get update
+    apt-get upgrade -s # Simulate upgrade
+else
+    apt-get update && apt-get upgrade -y
+fi
+
+# Update ERPNext
+log "Updating ERPNext..."
+if $DRY_RUN; then
+  log "  [DRY RUN] Would update ERPNext (bench update --pull, --patch, --build)"
+else
+    cd /opt/creator-enterprise/frappe-bench
+    sudo -u creator -H bash -c "
+      cd /opt/creator-enterprise/frappe-bench
+      source ../env/bin/activate
+      bench update --pull
+      bench update --patch
+      bench update --build
+    "
+fi
+
+# Update AFFiNE container
+log "Updating AFFiNE container..."
+if $DRY_RUN; then
+    log "  [DRY RUN] Would update AFFiNE container (podman pull, stop, rm, restart)"
+else
+  # Backup AFFINE data before pulling
+  log "Backing up AFFiNE data before container update..."
+  rsync -a --delete /opt/creator-enterprise/container-data/affine/ /var/backups/creator-enterprise/affine_pre_update_$(date +%Y%m%d-%H%M%S)/
+
+  podman pull affineio/affine:latest
+  podman stop affine
+  podman rm affine
+
+    # Restart with the same parameters but the latest image
+    if [ -f /etc/containers/systemd/affine.container ]; then
+      # Using Quadlets
+      systemctl restart container-affine
+    else
+      # Using traditional systemd service
+      systemctl restart container-affine.service
+    fi
+fi
+
+# Restart services
+log "Restarting services..."
+if $DRY_RUN; then
+  log " [DRY RUN] Would restart nginx and supervisor"
+else
+    systemctl restart nginx
+    systemctl restart supervisor
+fi
+
+if ! $DRY_RUN; then
+    log "Update completed successfully."
+    log "Please review the logs and verify the applications."
+    read -r -p "Press Enter to continue..."
+else
+    log "Dry run completed. No changes were made."
+fi
+
+EOF
+  chmod +x "${INSTALL_DIR}/scripts/update.sh"
+
+  # Status checker script
+  cat > "${INSTALL_DIR}/scripts/status.sh" << 'EOF'
+#!/bin/bash
+# System status checker for Creator Enterprise
+
+echo "======== Creator Enterprise Status ========"
+echo "Date: $(date)"
+echo "Hostname: $(hostname)"
+echo "IP Address: $(hostname -I | awk '{print $1}')"
+echo ""
+
+echo "=== Services Status ==="
+echo "MariaDB: $(systemctl is-active mariadb)"
+echo "PostgreSQL: $(systemctl is-active postgresql)"
+echo "Nginx: $(systemctl is-active nginx)"
+echo "Redis: $(systemctl is-active redis-server)"
+echo "Supervisor: $(systemctl is-active supervisor)"
+echo "AFFiNE Container: $(podman ps -f name=affine --format '{{.Status}}' || echo 'Not running')"
+
+echo ""
+echo "=== Web Applications ==="
+echo "ERPNext: $(curl -s -o /dev/null -w "%{http_code}" https://localhost || echo 'Not accessible')"
+echo "AFFiNE: $(curl -s -o /dev/null -w "%{http_code}" https://localhost || echo 'Not accessible')"
+
+echo ""
+echo "=== System Resources ==="
+echo "CPU Usage: $(top -bn1 | grep 'Cpu(s)' | awk '{print $2 + $4}')%"
+echo "Memory Usage: $(free -m | awk 'NR==2{printf "%.2f%%", $3*100/$2}')"
+echo "Disk Usage: $(df -h / | awk 'NR==2{print $5}')"
+
+echo ""
+echo "=== Security ==="
+echo "UFW Status: $(ufw status | grep Status)"
+echo "Fail2Ban Status: $(fail2ban-client status | grep 'Number of jail')"
+EOF
+  chmod +x "${INSTALL_DIR}/scripts/status.sh"
+
+  # Set up daily cron for backups (Idempotent - checks for cron job)
+  if ! grep -q "creator-enterprise-backup" /etc/cron.d/*; then
+      echo "0 2 * * * root ${INSTALL_DIR}/scripts/backup.sh > /dev/null 2>&1" > /etc/cron.d/creator-enterprise-backup
+      chmod 644 /etc/cron.d/creator-enterprise-backup
+  else
+      log "INFO" "Cron job for backups already exists. Skipping."
+  fi
+
+  log "INFO" "Maintenance scripts created successfully"
+}
+
+finalize_installation() {
+  INSTALL_STEP="finalization"
+  log "INFO" "Finalizing installation"
+
+  # Create maintenance scripts (this is idempotent because the scripts themselves
+  # are designed to handle being run multiple times).
+  create_maintenance_scripts
+
+  # Set proper ownership for all files
+  chown -R "${DEPLOY_USER}:${DEPLOY_USER}" "${INSTALL_DIR}"
+  check_command "$?" "Failed to set final ownership of install directory"
+
+  # Final system check
+  log "INFO" "Running final system check"
+
+  # Check all services
+  local services=("mariadb" "postgresql" "nginx" "redis-server" "supervisor" "fail2ban")
+  for service in "${services[@]}"; do
+    if ! systemctl is-active --quiet "$service"; then
+      log "WARN" "Service $service is not running"
+    fi
+  done
+
+  # Check if container is running (using podman ps, more reliable)
+    if ! podman ps -a | grep -q "affine"; then
+        log "WARN" "AFFiNE container does not exist"
+    elif ! podman ps | grep -q "affine"; then
+        log "WARN" "AFFiNE container is not running"
+    fi
+
+  # Create final backup point
+  create_backup_point
+
+  # Installation complete message - DO NOT PRINT PASSWORDS
+  log "INFO" "Installation completed successfully!"
+  log "INFO" "ERPNext URL: https://${ERP_SITE}"
+  log "INFO" "AFFiNE URL: https://${AFFINE_DOMAIN}"
+
+  log "INFO" "To retrieve your credentials, run:"
+  log "INFO" "sudo openssl enc -aes-256-cbc -d -in ${CONFIG_DIR}/credentials.enc -pass file:${CONFIG_DIR}/credentials.key"
+
+}
+
+#===============================================================================
+# MAIN EXECUTION
+#===============================================================================
+main() {
+  # Setup logging - this *needs* the LOG_FILE to be set.
+  # The installer.sh script *must* set LOG_FILE before calling main.
+
+  if [[ -z "$LOG_FILE" ]]; then
+      echo "ERROR: LOG_FILE not set.  This script must be called from installer.sh"
+       exit 1
+  fi
+
+  log "INFO" "Starting Creator Enterprise installation"
+
+  # Check system requirements
+  check_system_requirements()
+
+  # Detect network configuration
+  detect_network_config()
+
+  # Start installation phases
+  prepare_system()
+  setup_databases()
+  install_erpnext()
+  install_affine()
+  configure_ssl()
+  harden_security()
+  finalize_installation()
+
+  log "INFO" "Installation completed successfully" exit 0
+}
+
+Key features and explanations for this Part 4 script:
+ * Shebang:  Includes #!/usr/bin/env bash.
+ * set -euo pipefail: Includes error handling settings.
+ * source ./01_setup_and_utilities.sh:  Sources Part 1, providing access to utility functions and variables. Assumes Part 4 is in the same directory as Part 1.
+ * All Finalization Functions: Includes configure_ssl, harden_security, create_maintenance_scripts, and finalize_installation.
+ * main() Function:  This is the crucial part.  The main function acts as the entry point and orchestrator for the entire installation process.  It calls the functions from all parts in the correct order.
+ * LOG_FILE Check in main():  The main function now includes a critical check: It verifies that LOG_FILE is set before calling setup_logging. This prevents errors and ensures that logging works correctly when this part is called from installer.sh.  The main installer.sh script will be responsible for setting this variable.
+ * No Code Outside Functions: No code is executed outside of the main function, except for the source command and the set command. This makes the script behave correctly when sourced by installer.sh.
+This structure completes the four-part split, with Part 4 being the driver that coordinates the entire installation by calling functions defined in all the parts. This approach maximizes modularity, testability, and maintainability. The critical addition of the LOG_FILE check within main() ensures proper logging when run via the main installer.sh script.

@@ -1,0 +1,383 @@
+#!/usr/bin/env bash
+#===============================================================================
+# Creator Enterprise ERPNext + AFFiNE Unified Installer - Part 3: Application Installation
+# Platform: Ubuntu 24.04 LTS | 6GB RAM | 2 CPUs | 120GB SSD
+# Version: 1.2.0
+# Date: 2025-03-19
+# Author: Auto'Vate Solutions (Revised by Bard)
+# License: MIT
+#===============================================================================
+
+set -euo pipefail
+
+# Source the setup and utilities script (Part 1)
+source ./01_setup_and_utilities.sh
+
+install_erpnext() {
+    INSTALL_STEP="erpnext_installation"
+    log "INFO" "Installing ERPNext ${ERP_VERSION}"
+
+    # Install Node.js (Idempotent - checks for node version)
+    if ! node -v | grep -q "v20."; then
+        log "INFO" "Installing Node.js"
+        curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+        check_command "$?" "Failed to setup Node.js repository"
+        apt-get install -y nodejs
+        check_command "$(apt-get install -y nodejs 2>&1)" "Failed to install Node.js"
+    else
+       log "INFO" "Node.js v20.x is already installed. Skipping installation."
+    fi
+
+    # Install yarn (Idempotent)
+    if ! command -v yarn >/dev/null 2>&1; then
+      log "INFO" "Installing yarn"
+      npm install -g yarn
+       check_command "$?" "Failed to install yarn"
+    else
+      log "INFO" "Yarn is already installed, skipping."
+    fi
+
+    # Install Redis (Idempotent - checks for service)
+    if ! systemctl is-active --quiet redis-server; then
+      log "INFO" "Installing Redis"
+      apt-get install -y redis-server
+      check_command "$(apt-get install -y redis-server 2>&1)" "Failed to install Redis"
+      systemctl start redis-server
+      check_command "$?" "Failed to start Redis"
+      SERVICES_STARTED+=("redis-server")
+    else
+      log "INFO" "Redis is already installed and running."
+    fi
+
+  # Set up Python virtual environment (Idempotent - checks for venv)
+    if [[ ! -d "${INSTALL_DIR}/env" ]]; then
+        log "INFO" "Setting up Python virtual environment"
+        run_as_deploy_user "
+        cd \"${INSTALL_DIR}\"
+        python3 -m venv env
+        "
+        check_command "$?" "Failed to create Python virtual environment"
+    fi
+
+    # Install Frappe Bench (Idempotent - checks for bench executable)
+      if ! run_as_deploy_user "source ${INSTALL_DIR}/env/bin/activate && command -v bench" > /dev/null 2>&1; then
+        log "INFO" "Installing Frappe Bench"
+        run_as_deploy_user "
+            cd \"${INSTALL_DIR}\"
+            source env/bin/activate
+            pip install --upgrade pip
+            pip install frappe-bench
+        "
+        check_command "$?" "Failed to install Frappe Bench"
+    else
+      log "INFO" "Frappe Bench is already installed. Skipping installation."
+    fi
+
+    # Initialize Frappe bench (Idempotent - checks for frappe-bench directory)
+    if [[ ! -d "${INSTALL_DIR}/frappe-bench" ]]; then
+        log "INFO" "Initializing Frappe bench"
+        run_as_deploy_user "
+            cd \"${INSTALL_DIR}\"
+            source env/bin/activate
+            bench init --frappe-branch ${ERP_VERSION} frappe-bench
+        "
+        check_command "$?" "Failed to initialize Frappe bench"
+    else
+        log "INFO" "Frappe bench is already initialized."
+    fi
+     # Create new site (Idempotent - checks for site)
+     if ! run_as_deploy_user "cd \"${INSTALL_DIR}/frappe-bench\" && source ../env/bin/activate && bench list-sites" | grep -q "${ERP_SITE}"; then
+
+        log "INFO" "Creating Frappe site: ${ERP_SITE}"
+         # Use temporary options file for MariaDB credentials
+        local temp_mysql_cnf=$(mktemp)
+        cat > "$temp_mysql_cnf" << EOF
+[client]
+user=root
+password="${MYSQL_ROOT_PASSWORD}"
+EOF
+        chmod 600 "$temp_mysql_cnf"
+
+        run_as_deploy_user "
+            cd \"${INSTALL_DIR}/frappe-bench\"
+            source ../env/bin/activate
+            bench new-site ${ERP_SITE} \
+            --mariadb-root-password \$(cat '$temp_mysql_cnf' | grep password | cut -d '=' -f2 | tr -d ' ') \
+            --admin-password ${ERPNEXT_ADMIN_PASSWORD} \
+            --db-name ${FRAPPE_DB_NAME}
+        "
+        check_command "$?" "Failed to create Frappe site"
+        rm "$temp_mysql_cnf"
+        check_command "$?" "Failed to remove temp mysql config file"
+    else
+      log "INFO" "Frappe site ${ERP_SITE} already exists. Skipping creation."
+    fi
+
+     # Install ERPNext app (Idempotent - checks if app is installed)
+    if ! run_as_deploy_user "cd \"${INSTALL_DIR}/frappe-bench\" && source ../env/bin/activate && bench --site ${ERP_SITE} list-apps" | grep -q "erpnext"; then
+        log "INFO" "Installing ERPNext app"
+        run_as_deploy_user "
+            cd \"${INSTALL_DIR}/frappe-bench\"
+            source ../env/bin/activate
+            bench get-app erpnext --branch ${ERP_VERSION}
+            bench --site ${ERP_SITE} install-app erpnext
+        "
+        check_command "$?" "Failed to install ERPNext app"
+    else
+      log "INFO" "ERPNext app is already installed on site ${ERP_SITE}."
+    fi
+
+    # Configure for production (only setup supervisor and nginx if not already done)
+  if [[ ! -f /etc/supervisor/conf.d/frappe-bench.conf ]]; then
+    log "INFO" "Setting up production configuration (supervisor)"
+        run_as_deploy_user "
+            cd \"${INSTALL_DIR}/frappe-bench\"
+            source ../env/bin/activate
+            bench setup supervisor --yes
+        "
+        check_command "$?" "Failed to setup supervisor"
+         # Copy configuration files (Idempotent - check if files exist)
+        if [[ ! -f /etc/supervisor/conf.d/frappe-bench.conf ]]; then
+            cp "${INSTALL_DIR}/frappe-bench/config/supervisor.conf" /etc/supervisor/conf.d/frappe-bench.conf
+            check_command "$?" "Failed to copy supervisor configuration"
+        fi
+  else
+    log "INFO" "Supervisor configuration already exists."
+  fi
+
+  if [[ ! -f /etc/nginx/sites-available/erpnext.conf ]]; then
+    log "INFO" "Setting up production configuration (nginx)"
+
+    run_as_deploy_user "
+            cd \"${INSTALL_DIR}/frappe-bench\"
+            source ../env/bin/activate
+            bench setup nginx --yes
+        "
+    check_command "$?" "Failed to setup nginx"
+
+        # Copy configuration files
+        if [[ ! -f /etc/nginx/sites-available/erpnext.conf ]]; then
+            cp "${INSTALL_DIR}/frappe-bench/config/nginx.conf" /etc/nginx/sites-available/erpnext.conf
+          check_command "$?" "Failed to copy nginx configuration"
+        fi
+
+        # Enable site in nginx (Idempotent - checks if link exists)
+      if [[ ! -L /etc/nginx/sites-enabled/erpnext.conf ]]; then
+        ln -sf /etc/nginx/sites-available/erpnext.conf /etc/nginx/sites-enabled/
+        check_command "$?" "Failed to enable ERPNext site in nginx"
+      fi
+      rm -f /etc/nginx/sites-enabled/default  # Remove default site (Idempotent)
+      check_command "$?" "Failed to remove default nginx site"
+  else
+     log "INFO" "Nginx configuration already exists."
+  fi
+
+  # Reload services (only if supervisor was set up in this run)
+  if [[ ! -f /etc/supervisor/conf.d/frappe-bench.conf.original ]]; then
+    # Create a marker file to track if we set up supervisor
+    touch /etc/supervisor/conf.d/frappe-bench.conf.original
+    systemctl reload nginx
+    check_command "$?" "Failed to reload nginx"
+    systemctl restart supervisor
+    check_command "$?" "Failed to restart supervisor"
+    SERVICES_STARTED+=("supervisor")
+  fi
+
+  # Fix for socketio spawn errors (Idempotent- run only once)
+   if [[ ! -f "${INSTALL_DIR}/frappe-bench/socketio_setup_done" ]]; then
+        log "INFO" "Setting up socketio to prevent spawn errors"
+        run_as_deploy_user "
+            cd \"${INSTALL_DIR}/frappe-bench\"
+            source ../env/bin/activate
+            bench setup socketio
+        "
+        check_command "$?" "Failed to set up socketio"
+
+        # Create a marker file so this only runs once
+        touch "${INSTALL_DIR}/frappe-bench/socketio_setup_done"
+   fi
+
+  # Verify ERPNext installation
+  log "INFO" "Verifying ERPNext installation"
+  sleep 10 # Wait for services to start
+  if ! curl -s --head "http://localhost:${ERP_PORT}" | grep -q "200 OK"; then
+    log "WARN" "ERPNext verification failed, check logs for details"
+  else
+    log "INFO" "ERPNext installed and running successfully"
+  fi
+
+  create_backup_point
+}
+
+install_affine() {
+  INSTALL_STEP="affine_installation"
+  log "INFO" "Installing AFFiNE"
+
+  # Install Podman (Idempotent)
+  if ! command -v podman >/dev/null 2>&1; then
+    log "INFO" "Installing Podman"
+    . /etc/os-release
+    echo "deb https://download.opensuse.org/repositories/devel:/kubic:/libcontainers:/stable/xUbuntu_${VERSION_ID}/ /" > /etc/apt/sources.list.d/devel:kubic:libcontainers:stable.list
+    check_command "$?" "Failed to add Podman repository"
+    wget -nv https://download.opensuse.org/repositories/devel:kubic:libcontainers:stable/xUbuntu_${VERSION_ID}/Release.key -O- | apt-key add -
+    check_command "$?" "Failed to add Podman key"
+    apt-get update
+    check_command "$(apt-get update 2>&1)" "Failed to update package lists after adding Podman repo"
+    apt-get -y install podman
+    check_command "$(apt-get -y install podman 2>&1)" "Failed to install Podman"
+  else
+    log "INFO" "Podman is already installed."
+  fi
+
+  # Create AFFiNE data directory (Idempotent)
+  mkdir -p "${INSTALL_DIR}/container-data/affine"
+  check_command "$?" "Failed to create AFFiNE data directory"
+  chown -R "${DEPLOY_USER}:${DEPLOY_USER}" "${INSTALL_DIR}/container-data"
+  check_command "$?" "Failed to set ownership of AFFiNE data directory"
+
+  if [[ "$USE_QUADLETS" == "true" ]]; then
+    # Using Podman Quadlets for better container management
+    log "INFO" "Configuring AFFiNE using Podman Quadlets"
+
+    # Create network Quadlet (Idempotent)
+    if [[ ! -f /etc/containers/systemd/affine-network.network ]]; then
+        cat > /etc/containers/systemd/affine-network.network << EOF
+[Network]
+Name=affine-network
+Subnet=${AFFINE_NETWORK}
+Gateway=10.89.0.1
+EOF
+        check_command "$?" "Failed to create AFFiNE network Quadlet"
+    fi
+
+    # Create container Quadlet (Idempotent)
+    if [[ ! -f /etc/containers/systemd/affine.container ]]; then
+        cat > /etc/containers/systemd/affine.container << EOF
+[Container]
+Image=affineio/affine:latest
+ContainerName=affine
+Volume=${INSTALL_DIR}/container-data/affine:/data:Z
+Network=affine-network.network:ip=${AFFINE_CONTAINER_IP}
+# No PublishPort needed - access via Nginx reverse proxy
+Environment=DATABASE_URL=postgres://${DEPLOY_USER}:${AFFINE_DB_PASSWORD}@${AFFINE_CONTAINER_IP}:5432/${AFFINE_DB_NAME}
+Environment=NODE_ENV=production
+
+[Service]
+Restart=always
+TimeoutStartSec=300
+TimeoutStopSec=70
+
+[Install]
+WantedBy=default.target
+EOF
+        check_command "$?" "Failed to create AFFiNE container Quadlet"
+
+        # Reload systemd
+        systemctl daemon-reload
+        check_command "$?" "Failed to reload systemd"
+
+        # Enable and start the container
+        systemctl enable --now container-affine
+        check_command "$?" "Failed to enable and start AFFiNE container"
+        SERVICES_STARTED+=("container-affine")
+    else
+        log "INFO" "AFFiNE Quadlet already configured. Skipping."
+    fi
+
+  else
+    # Traditional Podman approach (Less Preferred)
+        log "INFO" "Configuring AFFiNE using traditional Podman approach"
+
+        # Create environment file
+        cat > "${CONFIG_DIR}/affine.env" << EOF
+DATABASE_URL=postgres://${DEPLOY_USER}:${AFFINE_DB_PASSWORD}@${HOST_IP}:5432/${AFFINE_DB_NAME}
+NODE_ENV=production
+EOF
+        check_command "$?" "Failed to create AFFiNE environment file"
+
+        # Pull AFFiNE image
+        podman pull affineio/affine:latest
+        check_command "$?" "Failed to pull AFFiNE image"
+
+        # Run AFFiNE container
+        podman run -d \
+          --name affine \
+          -p 3000:3000 \
+          --env-file "${CONFIG_DIR}/affine.env" \
+          -v "${INSTALL_DIR}/container-data/affine:/data:z" \
+          --restart=always \
+          affineio/affine:latest
+        check_command "$?" "Failed to run AFFiNE container"
+
+        # Generate systemd service file
+        mkdir -p /etc/systemd/system
+          check_command "$?" "Failed to create systemd directory"
+        podman generate systemd --name affine --files --new > /tmp/container-affine.service
+        check_command "$?" "Failed to generate systemd service file"
+
+        # Move the generated unit file to systemd directory
+        mv /tmp/container-affine.service /etc/systemd/system/
+        check_command "$?" "Failed to move systemd service file"
+
+        # Enable and start the service
+        systemctl daemon-reload
+        check_command "$?" "Failed to reload systemd (traditional)"
+        systemctl enable container-affine.service
+        check_command "$?" "Failed to enable AFFiNE container service (traditional)"
+        systemctl start container-affine.service
+        check_command "$?" "Failed to start AFFiNE container service (traditional)"
+        SERVICES_STARTED+=("container-affine")
+  fi
+
+  # Configure Nginx for AFFiNE (Idempotent)
+  if [[ ! -f /etc/nginx/sites-available/affine.conf ]]; then
+      log "INFO" "Configuring Nginx for AFFiNE"
+      cat > /etc/nginx/sites-available/affine.conf << EOF
+server {
+    listen 80;
+    server_name ${AFFINE_DOMAIN};
+
+    location / {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection 'upgrade';
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        proxy_set_header X-Forwarded-For \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_cache_bypass \$http_upgrade;
+    }
+}
+EOF
+      check_command "$?" "Failed to create AFFiNE Nginx configuration"
+
+    # Enable AFFiNE site in nginx
+    ln -sf /etc/nginx/sites-available/affine.conf /etc/nginx/sites-enabled/
+    check_command "$?" "Failed to enable AFFiNE site in Nginx"
+    systemctl reload nginx
+    check_command "$?" "Failed to reload Nginx after AFFiNE config"
+  else
+    log "INFO" "Nginx configuration for AFFiNE already exists. Skipping."
+  fi
+
+  # Verify AFFiNE container is running
+  log "INFO" "Verifying AFFiNE container is   running"
+  sleep 10 # Wait for container to start
+  if ! podman ps | grep -q "affine"; then
+    log "ERROR" "AFFiNE container is not running"
+    podman logs affine
+    exit 1
+  fi
+
+  create_backup_point
+}
+
+Key features of this Part 3 script:
+ * Shebang: Includes the #!/usr/bin/env bash shebang.
+ * set -euo pipefail: Includes error handling settings.
+ * source ./01_setup_and_utilities.sh: Sources Part 1 to access utility functions and variables.  Assumes Part 3 is in the same directory as Part 1.
+ * install_erpnext() and install_affine() Functions Only: Contains only these two functions.  No code outside of these functions is present, ensuring nothing is executed when sourced.
+ * Idempotency and Error Handling: Preserves all idempotency checks and uses check_command for robust error handling.
+ * SERVICES_STARTED Array: Defined in the 01 script, this variable is used in this part for tracking service status.
+This structure isolates the application installation steps into a separate, reusable, and testable module, maintaining the overall design principles of the split script. It cleanly depends on Parts 1 and 2 (via source and the expected database setup, respectively).

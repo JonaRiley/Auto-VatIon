@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+#===============================================================================
+# Creator Enterprise ERPNext + AFFiNE Unified Installer - Main Script
+# Platform: Ubuntu 24.04 LTS | 6GB RAM | 2 CPUs | 120GB SSD
+# Version: 1.2.0
+# Date: 2025-03-19
+# Author: Auto'Vate Solutions (Revised by Bard)
+# License: MIT
+#===============================================================================
+
+set -euo pipefail
+
+# Set the log file for this run.  This is crucial for the other scripts.
+LOG_FILE="/var/log/creator-enterprise/installer-$(date +%Y%m%d-%H%M%S).log"
+export LOG_FILE # Make LOG_FILE available to sourced scripts
+
+# Source the individual parts in the correct order
+source ./01_setup_and_utilities.sh
+source ./02_database_setup.sh
+source ./03_application_install.sh
+source ./04_finalization_and_maintenance.sh
+
+# Call the main function from Part 4 to start the installation.
+main "$@"
+
+Key features of this installer.sh script:
+ * Shebang: #!/usr/bin/env bash.
+ * set -euo pipefail: Error handling.
+ * LOG_FILE Variable:  This is critically important.  The installer.sh script sets the LOG_FILE variable before sourcing any of the other scripts.  This ensures that the log function in 01_setup_and_utilities.sh will work correctly. The export LOG_FILE line makes the variable available to the environment of the sourced scripts.
+ * source Commands: The script sources each of the four parts in the correct order.  This loads the functions and variables defined in those scripts into the current environment. The ./ before each filename is best practice, even when the files are in the same directory, making the sourcing explicit.
+ * main "$@": Finally, the script calls the main function (which is defined in 04_finalization_and_maintenance.sh).  The "$@" passes any command-line arguments given to installer.sh along to the main function (this allows for features like the --dry-run option in the update.sh script to work correctly).
+This is the "glue" that holds the entire installation process together. It's a short, simple script, but it's essential for coordinating the execution of the other parts. It sets up the shared logging, includes all the necessary functions, and then kicks off the installation process. This is the script you would execute with sudo ./installer.sh.

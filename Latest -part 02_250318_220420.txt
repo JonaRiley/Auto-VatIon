@@ -1,0 +1,197 @@
+#!/usr/bin/env bash
+#===============================================================================
+# Creator Enterprise ERPNext + AFFiNE Unified Installer - Part 2: Database Setup
+# Platform: Ubuntu 24.04 LTS | 6GB RAM | 2 CPUs | 120GB SSD
+# Version: 1.2.0
+# Date: 2025-03-19
+# Author: Auto'Vate Solutions (Revised by Bard)
+# License: MIT
+#===============================================================================
+
+set -euo pipefail
+
+# Source the setup and utilities script (Part 1)
+source ./01_setup_and_utilities.sh
+
+setup_databases() {
+  INSTALL_STEP="database_setup"
+  log "INFO" "Setting up databases"
+
+  # Install MariaDB for ERPNext (Idempotent)
+  if ! command -v mysql >/dev/null 2>&1; then
+    log "INFO" "Installing MariaDB"
+    DEBIAN_FRONTEND=noninteractive apt-get install -y mariadb-server mariadb-client
+    check_command "$(DEBIAN_FRONTEND=noninteractive apt-get install -y mariadb-server mariadb-client 2>&1)" "Failed to install MariaDB"
+  fi
+
+  # Secure MariaDB installation (Idempotent)
+  if ! systemctl is-active --quiet mariadb; then
+        log "INFO" "Securing MariaDB installation"
+        systemctl start mariadb
+        check_command "$?" "Failed to start MariaDB"
+        SERVICES_STARTED+=("mariadb")
+
+        # Secure MariaDB
+        mysql -e "
+          ALTER USER 'root'@'localhost' IDENTIFIED BY '${MYSQL_ROOT_PASSWORD}';
+          DELETE FROM mysql.user WHERE User='';
+          DELETE FROM mysql.user WHERE User='root' AND Host NOT IN ('localhost', '127.0.0.1', '::1');
+          DROP DATABASE IF EXISTS test;
+          DELETE FROM mysql.db WHERE Db='test' OR Db='test\\_%';
+          FLUSH PRIVILEGES;
+        "
+        check_command "$?" "Failed to secure MariaDB"
+  else
+        log "INFO" "MariaDB is already running. Skipping initial setup."
+  fi
+
+  # Optimize MariaDB configuration (Idempotent - checks for config file)
+  if [[ ! -f /etc/mysql/mariadb.conf.d/99-creator-enterprise.cnf ]]; then
+    log "INFO" "Optimizing MariaDB configuration"
+    local total_ram=$(free -m | awk '/^Mem:/{print $2}')
+    local innodb_buffer_pool_size=$(( total_ram * 60 / 100 )) # 60% of RAM, conservative for 6GB VPS
+    if [[ $innodb_buffer_pool_size -gt 3072 ]]; then
+      innodb_buffer_pool_size=3072 # Cap at 3GB for 6GB RAM systems.
+    fi
+
+    cat > /etc/mysql/mariadb.conf.d/99-creator-enterprise.cnf << EOF
+[mysqld]
+innodb_buffer_pool_size = ${innodb_buffer_pool_size}M
+innodb_log_file_size = 64M
+innodb_flush_log_at_trx_commit = 1
+max_connections = 150  # Conservative limit for 6GB VPS
+innodb_file_per_table = 1
+character-set-server = utf8mb4
+collation-server = utf8mb4_unicode_ci
+[client]
+default-character-set = utf8mb4
+EOF
+    check_command "$?" "Failed to create MariaDB configuration file"
+  else
+    log "INFO" "MariaDB optimization configuration already exists."
+  fi
+
+    # Restart MariaDB (if it was started in this run)
+    if [[ " ${SERVICES_STARTED[*]} " =~ " mariadb " ]]; then
+        systemctl restart mariadb
+        check_command "$?" "Failed to restart MariaDB"
+    fi
+
+  # Create ERPNext databases (Idempotent)
+  log "INFO" "Creating ERPNext databases"
+  # Use temporary options file for credentials
+    local temp_mysql_cnf=$(mktemp)
+    cat > "$temp_mysql_cnf" << EOF
+[client]
+user=root
+password="${MYSQL_ROOT_PASSWORD}"
+EOF
+    chmod 600 "$temp_mysql_cnf"
+    mysql --defaults-extra-file="$temp_mysql_cnf" -e "
+    CREATE DATABASE IF NOT EXISTS \`${FRAPPE_DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+    CREATE DATABASE IF NOT EXISTS \`${ERPNEXT_DB_NAME}\` CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+  "
+  check_command "$?" "Failed to create ERPNext databases"
+  rm "$temp_mysql_cnf"
+  check_command "$?" "Failed to remove temp MySQL config file"
+
+  # Install PostgreSQL for AFFiNE (Idempotent - checks for package)
+  if ! dpkg -l | grep -q "postgresql-16"; then
+    log "INFO" "Installing PostgreSQL"
+
+    # Add PostgreSQL repository
+    echo "deb http://apt.postgresql.org/pub/repos/apt/ $(lsb_release -cs)-pgdg main" > /etc/apt/sources.list.d/pgdg.list
+    check_command "$?" "Failed to add PostgreSQL repository"
+    wget --quiet -O - https://www.postgresql.org/media/keys/ACCC4CF8.asc | apt-key add -
+    check_command "$?" "Failed to add PostgreSQL key"
+    apt-get update
+    check_command "$(apt-get update 2>&1)" "Failed to update package lists after adding PostgreSQL repo"
+
+    # Install PostgreSQL
+    DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql-16 postgresql-contrib-16
+    check_command "$(DEBIAN_FRONTEND=noninteractive apt-get install -y postgresql-16 postgresql-contrib-16 2>&1)" "Failed to install PostgreSQL"
+  else
+    log "INFO" "PostgreSQL 16 is already installed."
+  fi
+
+  # Start PostgreSQL (if it was just installed)
+    if ! systemctl is-active --quiet postgresql; then
+        log "INFO" "Starting PostgreSQL service"
+        systemctl start postgresql
+        check_command "$?" "Failed to start PostgreSQL"
+        SERVICES_STARTED+=("postgresql")
+    else
+        log "INFO" "PostgreSQL is already running."
+    fi
+
+    # Set PostgreSQL password and create database for AFFiNE (Idempotent - checks for user and db)
+    if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${DEPLOY_USER}'" | grep -q 1; then
+      log "INFO" "Configuring PostgreSQL"
+      sudo -u postgres psql -c "ALTER USER postgres PASSWORD '${POSTGRES_PASSWORD}';"
+      check_command "$?" "Failed to set PostgreSQL password"
+
+      # Create AFFiNE database and user
+      sudo -u postgres psql -c "CREATE DATABASE ${AFFINE_DB_NAME};"
+      check_command "$?" "Failed to create AFFiNE database"
+      sudo -u postgres psql -c "CREATE USER ${DEPLOY_USER} WITH ENCRYPTED PASSWORD '${AFFINE_DB_PASSWORD}';"
+      check_command "$?" "Failed to create AFFiNE user"
+      sudo -u postgres psql -c "GRANT ALL PRIVILEGES ON DATABASE ${AFFINE_DB_NAME} TO ${DEPLOY_USER};"
+      check_command "$?" "Failed to grant privileges to AFFiNE user"
+    else
+       log "INFO" "PostgreSQL user and database for AFFiNE already configured."
+    fi
+
+    # Configure PostgreSQL to listen on all interfaces and restrict AFFINE user access (Idempotent)
+    local pg_conf_path=$(find /etc/postgresql -name "postgresql.conf" | sort -r | head -n1)
+    local pg_hba_path=$(find /etc/postgresql -name "pg_hba.conf" | sort -r | head -n1)
+
+    if ! grep -q "listen_addresses = '*'" "${pg_conf_path}"; then
+        sed -i "s/#listen_addresses = 'localhost'/listen_addresses = '*'/" "${pg_conf_path}"
+        check_command "$?" "Failed to configure PostgreSQL listen_addresses"
+    fi
+
+    if ! grep -q "host *${AFFINE_DB_NAME} *${DEPLOY_USER} *${AFFINE_NETWORK} *md5" "${pg_hba_path}"; then
+        echo "host    ${AFFINE_DB_NAME}    ${DEPLOY_USER}    ${AFFINE_NETWORK}    md5" >> "${pg_hba_path}"
+        check_command "$?" "Failed to configure PostgreSQL pg_hba.conf"
+    fi
+
+    # Restart PostgreSQL (if it was started or configured in this run)
+     if [[ " ${SERVICES_STARTED[*]} " =~ " postgresql " ]]; then
+        systemctl restart postgresql
+        check_command "$?" "Failed to restart PostgreSQL"
+    fi
+
+  # Test database connections
+  log "INFO" "Testing database connections"
+   # Use temporary options file for MariaDB credentials
+    local temp_mysql_cnf=$(mktemp)
+    cat > "$temp_mysql_cnf" << EOF
+[client]
+user=root
+password="${MYSQL_ROOT_PASSWORD}"
+EOF
+    chmod 600 "$temp_mysql_cnf"
+  if ! mysql --defaults-extra-file="$temp_mysql_cnf" -e "SHOW DATABASES;" > /dev/null; then
+    log "ERROR" "Failed to connect to MariaDB"
+    exit 1
+  fi
+  rm "$temp_mysql_cnf"
+  check_command "$?" "Failed to remove temporary mysql config during connection test."
+
+  if ! sudo -u postgres psql -c "\l" > /dev/null; then
+    log "ERROR" "Failed to connect to PostgreSQL"
+    exit 1
+  fi
+
+  log "INFO" "Database setup completed successfully"
+  create_backup_point
+}
+
+Key features of this Part 2 script:
+ * Shebang:  Includes the #!/usr/bin/env bash shebang to be a valid, runnable script.
+ * set -euo pipefail:  Includes the error handling settings.
+ * source ./01_setup_and_utilities.sh: This line is crucially important. It sources (includes) the contents of Part 1.  This makes all the functions and variables defined in Part 1 available to Part 2.  This is how the dependency is managed.  This line assumes that Part 2 is located in the same directory as Part 1.
+ * setup_databases Function Only:  The script contains only the setup_databases function.  No other code is present outside of this function. This ensures that nothing is executed automatically when the script is sourced. The main script will be responsible for calling this function.
+ * Idempotency and Error Handling:  The script preserves all the idempotency checks and error handling (using check_command) from the original combined script.
+ * SERVICES_STARTED Array: This variable defined in 01 script is used here to determine if postgresql or mariadb needs restarting, if any configuration changes are made.
+This structure ensures that Part 2 is a well-defined, reusable, and testable module that depends correctly on Part 1.  It's a significant improvement in terms of code organization and maintainability.

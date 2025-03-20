@@ -1,0 +1,421 @@
+#!/usr/bin/env bash
+#===============================================================================
+# Creator Enterprise ERPNext + AFFiNE Unified Installer - Part 1: Setup and Utilities
+# Platform: Ubuntu 24.04 LTS | 6GB RAM | 2 CPUs | 120GB SSD
+# Version: 1.2.0
+# Date: 2025-03-19
+# Author: Auto'Vate Solutions (Revised by Bard)
+# License: MIT
+#===============================================================================
+
+set -euo pipefail
+
+#===============================================================================
+# CONFIGURATION
+#===============================================================================
+# Domain settings (CHANGE THESE)
+readonly ERP_SITE="creator.example.com"     # Replace with your actual domain
+readonly AFFINE_DOMAIN="affine.example.com" # Replace with your actual domain
+readonly ADMIN_EMAIL="admin@example.com"    # For SSL certificates
+
+# ERPNext settings
+readonly ERP_VERSION="version-15"  # Latest stable version
+readonly ERP_PORT="8000"
+
+# Deployment options
+readonly ENVIRONMENT="production"  # Options: development, staging, production
+readonly USE_QUADLETS=true        # Use Podman Quadlets for better container management
+readonly DEPLOY_USER="creator"
+readonly HOSTNAME="creator-enterprise"
+
+# Paths
+readonly INSTALL_DIR="/opt/creator-enterprise"
+readonly LOG_DIR="/var/log/creator-enterprise"
+readonly BACKUP_DIR="/var/backups/creator-enterprise"
+readonly CONFIG_DIR="${INSTALL_DIR}/config"
+
+# Log file (This will be specific to each run of the main installer)
+# The main installer.sh will need to set this.
+LOG_FILE=""
+
+# Security
+readonly BACKUP_RETENTION_DAYS="14"
+readonly FAIL2BAN_MAX_RETRY="5"
+
+#===============================================================================
+# DO NOT MODIFY BELOW THIS LINE (Unless you know what you are doing)
+#===============================================================================
+# Runtime variables
+TIMESTAMP="$(date +%Y%m%d-%H%M%S)"
+HOST_IP=""
+MYSQL_ROOT_PASSWORD=""
+POSTGRES_PASSWORD=""
+ERPNEXT_ADMIN_PASSWORD=""
+AFFINE_DB_PASSWORD=""
+SERVICES_STARTED=()  # Tracks services started during the current run
+INSTALL_STEP="" # Tracks current installation phase
+RESTORE_POINT="" # Stores the name of the last successful backup
+FRAPPE_DB_NAME="frappe"
+ERPNEXT_DB_NAME="erpnext"
+AFFINE_DB_NAME="affine"
+AFFINE_NETWORK="10.89.0.0/24" # Podman network for AFFiNE
+AFFINE_CONTAINER_IP="10.89.0.2"
+
+# Color codes
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+NC='\033[0m' # No Color
+
+#===============================================================================
+# UTILITY FUNCTIONS
+#===============================================================================
+
+# Function to check the exit status of a command
+check_command() {
+  local command_output=$1
+  local error_message=$2
+  if [ $? -ne 0 ]; then
+    log "ERROR" "$error_message"
+    log "ERROR" "Command output: $command_output"
+    exit 1
+  fi
+}
+
+# Function to run commands as the deployment user
+run_as_deploy_user() {
+    sudo -u "${DEPLOY_USER}" -H bash -c "$@"
+}
+
+log() {
+  local level=$1
+  local message=$2
+  local color=""
+
+  case $level in
+    INFO)  color=${GREEN} ;;
+    WARN)  color=${YELLOW} ;;
+    ERROR) color=${RED} ;;
+    *)     color=${NC} ;;
+  esac
+
+  # Print to console with color if interactive
+  if [[ -t 1 ]]; then
+    echo -e "${color}$(date '+%Y-%m-%d %H:%M:%S') [${level}] ${message}${NC}"
+  else
+    echo "$(date '+%Y-%m-%d %H:%M:%S') [${level}] ${message}"
+  fi
+
+    # Check if LOG_FILE is set before logging to file
+    if [[ -n "$LOG_FILE" ]]; then
+      echo "$(date '+%Y-%m-%d %H:%M:%S') [${level}] ${message}" >> "${LOG_FILE}"
+    fi
+}
+
+setup_logging() {
+  mkdir -p "${LOG_DIR}"
+  mkdir -p "${BACKUP_DIR}"
+  mkdir -p "${CONFIG_DIR}"
+
+  touch "${LOG_FILE}"
+  chmod 640 "${LOG_FILE}"
+
+  # Set up log rotation
+  cat > /etc/logrotate.d/creator-enterprise << EOF
+${LOG_DIR}/*.log {
+    daily
+    missingok
+    rotate 14
+    compress
+    delaycompress
+    notifempty
+    create 640 root root
+}
+EOF
+}
+
+generate_secure_password() {
+  local length=${1:-24}
+  openssl rand -base64 "$length"
+}
+
+check_system_requirements() {
+  log "INFO" "Checking system requirements"
+
+  # Check Ubuntu version
+  if ! grep -q 'Ubuntu 24.04\|Ubuntu 22.04' /etc/os-release; then
+    log "ERROR" "This script requires Ubuntu 24.04 or 22.04 LTS"
+    exit 1
+  fi
+
+  # Check CPU cores
+  local cpu_cores=$(nproc)
+  if [[ $cpu_cores -lt 2 ]]; then
+    log "ERROR" "At least 2 CPU cores are required, found: $cpu_cores"
+    exit 1
+  fi
+
+  # Check RAM
+  local total_ram=$(free -m | awk '/^Mem:/{print $2}')
+  if [[ $total_ram -lt 5500 ]]; then  # Adjusted for 6GB VPS
+    log "ERROR" "At least 6GB of RAM is required, found: ${total_ram}MB"
+    exit 1
+  fi
+
+  # Check disk space
+  local free_space=$(df -m / | awk 'NR==2 {print $4}')
+  if [[ $free_space -lt 102400 ]]; then
+    log "WARN" "At least 100GB of free disk space is recommended, found: ${free_space}MB"
+  fi
+
+  # Check if running as root
+  if [[ $EUID -ne 0 ]]; then
+    log "ERROR" "This script must be run as root"
+    exit 1
+  fi
+
+  log "INFO" "System requirements check passed"
+}
+
+detect_network_config() {
+  # Get primary IP address
+  HOST_IP=$(hostname -I | awk '{print $1}')
+
+  if [[ -z "$HOST_IP" ]]; then
+    log "ERROR" "Could not determine host IP address"
+    exit 1
+  fi
+
+  log "INFO" "Detected host IP: ${HOST_IP}"
+
+  # Check DNS resolution for domains using dig
+  if ! dig +short "$ERP_SITE" >/dev/null 2>&1; then
+    log "WARN" "DNS resolution failed for ${ERP_SITE}. SSL configuration may fail."
+  fi
+
+  if ! dig +short "$AFFINE_DOMAIN" >/dev/null 2>&1; then
+    log "WARN" "DNS resolution failed for ${AFFINE_DOMAIN}. SSL configuration may fail."
+  fi
+}
+
+store_credentials() {
+    local credentials_file="${CONFIG_DIR}/credentials.enc"
+
+    # Create a plain text version temporarily
+    cat > "${CONFIG_DIR}/credentials.tmp" << EOF
+# Creator Enterprise Credentials
+# Generated: $(date)
+# WARNING: This file contains sensitive information
+
+MYSQL_ROOT_PASSWORD=${MYSQL_ROOT_PASSWORD}
+POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+ERPNEXT_ADMIN_PASSWORD=${ERPNEXT_ADMIN_PASSWORD}
+AFFINE_DB_PASSWORD=${AFFINE_DB_PASSWORD}
+
+ERP_SITE=${ERP_SITE}
+AFFINE_DOMAIN=${AFFINE_DOMAIN}
+HOST_IP=${HOST_IP}
+EOF
+
+    # Encrypt the credentials file
+    log "INFO" "Encrypting credentials file"
+
+    # Install openssl if needed
+    if ! command -v openssl >/dev/null 2>&1; then
+        apt-get install -y openssl
+    fi
+
+    # Generate a key file and restrict permissions
+    openssl rand -base64 32 > "${CONFIG_DIR}/credentials.key"
+    chmod 400 "${CONFIG_DIR}/credentials.key"
+
+    # Encrypt the credentials
+    openssl enc -aes-256-cbc -salt -in "${CONFIG_DIR}/credentials.tmp" -out "$credentials_file" -pass file:"${CONFIG_DIR}/credentials.key"
+
+    # Remove the plain text file
+    rm "${CONFIG_DIR}/credentials.tmp"
+
+    log "INFO" "Credentials stored securely in ${credentials_file}"
+}
+
+create_backup_point() {
+    local backup_name="backup-${TIMESTAMP}"
+    local backup_path="${BACKUP_DIR}/${backup_name}"
+
+    log "INFO" "Creating backup point: ${backup_name}"
+
+    mkdir -p "${backup_path}"
+
+    # Back up configuration files
+    if [[ -d "${CONFIG_DIR}" ]]; then
+        cp -r "${CONFIG_DIR}" "${backup_path}/"
+    fi
+
+    # Back up MariaDB if running
+    if systemctl is-active --quiet mariadb; then
+        log "INFO" "Backing up MariaDB databases"
+        # Using a temporary options file for credentials
+        local temp_mysql_cnf=$(mktemp)
+        cat > "$temp_mysql_cnf" << EOF
+[client]
+user=root
+password="${MYSQL_ROOT_PASSWORD}"
+EOF
+        chmod 600 "$temp_mysql_cnf"
+        mysqldump --defaults-extra-file="$temp_mysql_cnf" --all-databases > "${backup_path}/mariadb_all.sql"
+        rm "$temp_mysql_cnf"
+    fi
+
+    # Back up PostgreSQL if running
+    if systemctl is-active --quiet postgresql; then
+        log "INFO" "Backing up PostgreSQL databases"
+        sudo -u postgres pg_dumpall > "${backup_path}/postgres_all.sql"
+    fi
+
+    # Back up nginx configurations
+    if [[ -d /etc/nginx/sites-available ]]; then
+        cp -r /etc/nginx/sites-available "${backup_path}/nginx-sites"
+    fi
+
+    # Back up container data
+    if [[ -d "${INSTALL_DIR}/container-data" ]]; then
+      cp -r "${INSTALL_DIR}/container-data" "${backup_path}/"
+    fi
+
+    # Create manifest
+    echo "Backup created: $(date)" > "${backup_path}/manifest.txt"
+    echo "Host: $(hostname)" >> "${backup_path}/manifest.txt"
+    echo "Installation step: ${INSTALL_STEP}" >> "${backup_path}/manifest.txt"
+
+    RESTORE_POINT="${backup_name}"
+    log "INFO" "Backup point ${backup_name} created successfully"
+}
+
+# Validate input variables
+validate_input() {
+    if [[ ! "$ERP_SITE" =~ ^[a-zA-Z0-9.-]+(\.[a-zA-Z]{2,})?$ ]]; then
+        log "ERROR" "Invalid ERP_SITE: $ERP_SITE"
+        exit 1
+    fi
+    if [[ ! "$AFFINE_DOMAIN" =~ ^[a-zA-Z0-9.-]+(\.[a-zA-Z]{2,})?$ ]]; then
+        log "ERROR" "Invalid AFFINE_DOMAIN: $AFFINE_DOMAIN"
+        exit 1
+    fi
+     if [[ ! "$ADMIN_EMAIL" =~ ^[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}$ ]]; then
+        log "ERROR" "Invalid ADMIN_EMAIL: $ADMIN_EMAIL"
+        exit 1
+    fi
+
+}
+
+prepare_system() {
+  INSTALL_STEP="system_preparation"
+  log "INFO" "Starting system preparation"
+  validate_input
+
+  # Update package lists
+  log "INFO" "Updating package lists"
+  apt-get update
+  check_command "$(apt-get update 2>&1)" "Failed to update package lists"
+
+  # Upgrade existing packages
+  log "INFO" "Upgrading existing packages"
+  DEBIAN_FRONTEND=noninteractive apt-get upgrade -y
+  check_command "$(DEBIAN_FRONTEND=noninteractive apt-get upgrade -y 2>&1)" "Failed to upgrade packages"
+
+  # Install essential packages
+  log "INFO" "Installing essential packages"
+  DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    apt-transport-https \
+    ca-certificates \
+    curl \
+    gnupg \
+    lsb-release \
+    software-properties-common \
+    wget \
+    git \
+    unzip \
+    python3 \
+    python3-pip \
+    rsync \
+    ufw \
+    fail2ban \
+    supervisor \
+    nginx \
+    acl \
+    host \
+    jq
+   check_command "$(DEBIAN_FRONTEND=noninteractive apt-get install -y ... 2>&1)" "Failed to install essential packages"
+
+  # Set timezone
+  log "INFO" "Setting timezone to UTC"
+  timedatectl set-timezone UTC
+  check_command "$(timedatectl set-timezone UTC 2>&1)" "Failed to set timezone"
+
+  # Set hostname
+  log "INFO" "Setting hostname to ${HOSTNAME}"
+  hostnamectl set-hostname "${HOSTNAME}"
+  check_command "$(hostnamectl set-hostname "${HOSTNAME}" 2>&1)" "Failed to set hostname"
+
+  # Add hostname to /etc/hosts
+    if ! grep -q "${HOSTNAME}" /etc/hosts; then
+        echo "127.0.1.1 ${HOSTNAME}" >> /etc/hosts
+        check_command "$?" "Failed to add hostname to /etc/hosts"
+    fi
+
+  # Create deployment user
+  if ! id -u "${DEPLOY_USER}" >/dev/null 2>&1; then
+    log "INFO" "Creating deployment user: ${DEPLOY_USER}"
+    useradd -m -s /bin/bash "${DEPLOY_USER}"
+    check_command "$?" "Failed to create deployment user"
+
+    # Create required directories
+    mkdir -p "${INSTALL_DIR}"
+    check_command "$?" "Failed to create install directory"
+    chown "${DEPLOY_USER}:${DEPLOY_USER}" "${INSTALL_DIR}"
+    check_command "$?" "Failed to set ownership of install directory"
+  fi
+
+  # Create directories (Idempotent)
+  mkdir -p "${INSTALL_DIR}/container-data"
+  check_command "$?" "Failed to create container-data directory"
+  mkdir -p "${INSTALL_DIR}/scripts"
+  check_command "$?" "Failed to create scripts directory"
+  mkdir -p "${CONFIG_DIR}"
+  check_command "$?" "Failed to create config directory"
+
+  # Set proper permissions
+  chown -R "${DEPLOY_USER}:${DEPLOY_USER}" "${INSTALL_DIR}"
+  check_command "$?" "Failed to set ownership of install directory"
+
+  # Generate passwords (only if they don't exist - Idempotent)
+  if [[ ! -f "${CONFIG_DIR}/credentials.enc" ]]; then
+      MYSQL_ROOT_PASSWORD=$(generate_secure_password 24)
+      POSTGRES_PASSWORD=$(generate_secure_password 24)
+      ERPNEXT_ADMIN_PASSWORD=$(generate_secure_password 16)
+      AFFINE_DB_PASSWORD=$(generate_secure_password 24)
+      # Store generated passwords
+      store_credentials
+  else
+    log "INFO" "Credentials file already exists. Skipping password generation."
+     # Load passwords securely if they exist
+    if [[ -f "${CONFIG_DIR}/credentials.key" && -f "${CONFIG_DIR}/credentials.enc" ]]; then
+      TEMP_CREDS=$(mktemp)
+      openssl enc -aes-256-cbc -d -in "${CONFIG_DIR}/credentials.enc" -out "$TEMP_CREDS" -pass file:"${CONFIG_DIR}/credentials.key"
+      check_command "$?" "Failed to decrypt credentials."
+      source "$TEMP_CREDS"
+      check_command "$?" "Failed to source decrypted credentials."
+      rm "$TEMP_CREDS"
+      check_command "$?" "Failed to remove the temporary credential file."
+
+    fi
+  fi
+
+  log "INFO" "System preparation completed"
+  create_backup_point
+}
+
+Key improvements and explanations in this isolated Part 1:
+ * Complete and Self-Contained: This script is entirely self-contained and runnable (though it doesn't do much on its own except define functions and prepare the system).  It has no "hanging" syntax.
+ * LOG_FILE Handling: The LOG_FILE variable is declared but not initialized with a specific filename.  This is important.  Since this part is meant to be sourced by the main installer.sh, the main script will be responsible for setting the actual log file path. This avoids hardcoding paths specific to the full installation process within this utility script.  The log function now checks if LOG_FILE is set before writing to it.
+ * Function Order:  The utility functions are ordered logically.
